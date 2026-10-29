@@ -201,9 +201,84 @@ def submit_reg(ses, ua, server, fn, ln, contact, pw, tokens):
 
 MAX_RETRY = 3
 
+# ─── phone exist check via forgotten flow ─────────────────────
+def check_phone_exists(contact, ua):
+    """
+    True  = এই number এ Facebook account আছে
+    False = account নেই, create করা যাবে
+    """
+    ses = requests.Session()
+    ses.headers.update({
+        "User-Agent": ua,
+        "Accept": "text/html,application/xhtml+xml,*/*;q=0.9",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1"
+    })
+    ses.cookies.set("locale", "en_US", domain=".facebook.com")
+
+    server = "limited.facebook.com"
+    hdrs = {
+        "Host": server, "User-Agent": ua,
+        "Accept": "text/html,application/xhtml+xml,*/*;q=0.9",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": f"https://{server}/login/",
+    }
+    try:
+        r1 = ses.get(f"https://{server}/login/identify/",
+                     headers=hdrs, timeout=15)
+        t1  = extract_tokens(r1.text)
+        lsd = t1.get("lsd", "")
+
+        r2 = ses.post(
+            f"https://{server}/login/identify/",
+            data={
+                "lsd": lsd, "email": contact,
+                "did_use_age_gate": "0",
+                "login_source": "find_friends",
+                "skip_api_login": "1", "submit": "Search",
+            },
+            headers={**hdrs,
+                     "Content-Type": "application/x-www-form-urlencoded",
+                     "Origin": f"https://{server}"},
+            timeout=15)
+
+        html2 = r2.text.lower()
+
+        # account নেই এই signals গুলো
+        not_found = [
+            "couldn't find your account",
+            "couldn't find",
+            "no account found",
+            "not find",
+        ]
+        if any(s in html2 for s in not_found):
+            return False
+
+        # account আছে এই signals গুলো
+        found = [
+            "recover your account",
+            "reset your password",
+            "send code",
+            "send sms",
+            "confirm your identity",
+            "name=\"n\"",
+            "name=\"ars\"",
+        ]
+        if any(s in html2 for s in found):
+            return True
+
+        # n token থাকলে account আছে
+        if re.search(r'name="n"\s+value="([^"]+)"', r2.text):
+            return True
+
+        return False
+    except:
+        return False
+
 # ─── forgotten: OTP request (fresh session) ───────────────────
-def forgotten_request_otp(contact, ses, ua):
-    # fresh session — create session cookie mix এড়াতে
+def forgotten_request_otp(contact, ua):
     fresh_ses = requests.Session()
     fresh_ses.headers.update({
         "User-Agent": ua,
@@ -223,7 +298,6 @@ def forgotten_request_otp(contact, ses, ua):
         "Referer": f"https://{server}/login/",
     }
 
-    # Step 1: identify page
     try:
         r1 = fresh_ses.get(f"https://{server}/login/identify/",
                            headers=hdrs, timeout=15)
@@ -232,7 +306,6 @@ def forgotten_request_otp(contact, ses, ua):
     t1  = extract_tokens(r1.text)
     lsd = t1.get("lsd", "")
 
-    # Step 2: submit phone
     try:
         r2 = fresh_ses.post(
             f"https://{server}/login/identify/",
@@ -267,7 +340,6 @@ def forgotten_request_otp(contact, ses, ua):
     recover_html = ""
     sent = False
 
-    # Step 3: OTP পাঠাও SMS → email fallback
     for send_via in ("sms", "email"):
         try:
             r3 = fresh_ses.post(
@@ -298,12 +370,11 @@ def forgotten_request_otp(contact, ses, ua):
     return True, {
         "lsd": lsd3, "n": n3_val, "ars": ars3_val,
         "server": server, "hdrs": hdrs,
-        "_ses": fresh_ses   # same session দিয়ে submit করতে হবে
+        "_ses": fresh_ses
     }
 
 # ─── forgotten: OTP submit ────────────────────────────────────
 def forgotten_submit_otp(code, recover_tokens):
-    # fresh_ses ব্যবহার করো — same session যেটায় OTP গেছে
     active_ses = recover_tokens.get("_ses")
     if active_ses is None: return False
 
@@ -352,7 +423,6 @@ def forgotten_submit_otp(code, recover_tokens):
         if any(s in html for s in fail_strings):     return False
         if r.status_code == 200 and "recover" not in url: return True
         return False
-
     except: return False
 
 # ─── create account ───────────────────────────────────────────
@@ -374,17 +444,17 @@ def create_one_ext(uid, contact, pw):
         is_cp  = ("checkpoint" in r2.url.lower() or
                   "checkpoint" in r2.text[:600].lower())
         if fb_uid and fb_uid != "0":
-            return "ok", fb_uid, ck_str, dob, ses, ua
+            return "ok", fb_uid, ck_str, dob, ua
         elif is_cp:
             save_cp_user(uid, contact, pw)
-            return "checkpoint", "", "", "", ses, ua
+            return "checkpoint", "", "", "", ua
         else:
             if attempt < MAX_RETRY:
                 time.sleep(random.uniform(1, 3)); continue
             save_fail_user(uid, contact, r2.text[:100])
-            return "error", "", "", "", ses, ua
+            return "error", "", "", "", ua
     save_fail_user(uid, contact, "max_retry")
-    return "error", "", "", "", None, None
+    return "error", "", "", "", rand_ua()
 
 # ═══════════════════════════════════════════════════════════════
 # KEYBOARDS
@@ -608,16 +678,38 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await show_home(update.message, uid)
 
 # ═══════════════════════════════════════════════════════════════
-# CREATE → SHOW INFO → ASK OTP
+# CREATE → CHECK EXIST → SHOW INFO → ASK OTP
 # ═══════════════════════════════════════════════════════════════
 
 async def _do_create(update, ctx, uid, phone, pw):
     msg = await update.message.reply_text(
-        f"🚀 *Creating...*\n📱 `{phone}`\n🔑 `{pw}`\n\n⏳ Please wait...",
+        f"🔍 *Checking number...*\n📱 `{phone}`\n\n⏳ Please wait...",
         parse_mode="Markdown")
     loop = asyncio.get_event_loop()
+    ua   = rand_ua()
 
-    result, fb_uid, ck_str, dob, ses, ua = await loop.run_in_executor(
+    # ── Step 1: phone exist check ─────────────────────────────
+    exists = await loop.run_in_executor(
+        None, check_phone_exists, phone, ua)
+
+    if exists:
+        await msg.edit_text(
+            f"⚠️ *Number Already Registered!*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📱 `{phone}`\n\n"
+            f"❌ আপনার number এ আগে থেকেই Facebook account আছে।\n"
+            f"অন্য number দিয়ে try করুন।",
+            parse_mode="Markdown")
+        await update.message.reply_text("🏠", reply_markup=main_keyboard())
+        return
+
+    # ── Step 2: account create ────────────────────────────────
+    await msg.edit_text(
+        f"✅ *Number OK!*\n📱 `{phone}`\n\n"
+        f"🚀 Creating account...",
+        parse_mode="Markdown")
+
+    result, fb_uid, ck_str, dob, ua = await loop.run_in_executor(
         None, create_one_ext, uid, phone, pw)
 
     if result == "checkpoint":
@@ -632,7 +724,7 @@ async def _do_create(update, ctx, uid, phone, pw):
         await update.message.reply_text("🏠", reply_markup=main_keyboard())
         return
 
-    # ── Step 1: UID + Cookie আগে দেখাও ───────────────────────
+    # ── Step 3: UID + Cookie দেখাও ───────────────────────────
     p1 = ck_str[:300]; p2 = ck_str[300:]
     await msg.edit_text(
         f"✅ *Account Created!*\n"
@@ -646,14 +738,14 @@ async def _do_create(update, ctx, uid, phone, pw):
     if p2:
         await update.message.reply_text(f"`{p2}`", parse_mode="Markdown")
 
-    # ── Step 2: forgotten flow → OTP পাঠাও ───────────────────
+    # ── Step 4: forgotten flow → OTP পাঠাও ───────────────────
     otp_msg = await update.message.reply_text(
         "📨 *Sending OTP...*", parse_mode="Markdown")
 
     sent, recover_tokens = await loop.run_in_executor(
-        None, forgotten_request_otp, phone, ses, ua)
+        None, forgotten_request_otp, phone, ua)
 
-    # ── Step 3: সবসময় OTP চাও ────────────────────────────────
+    # ── Step 5: সবসময় OTP চাও ───────────────────────────────
     ctx.user_data["state"] = "wait_otp"
     ctx.user_data["pending_account"] = {
         "recover_tokens": recover_tokens,
