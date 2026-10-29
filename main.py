@@ -201,7 +201,103 @@ def submit_reg(ses, ua, server, fn, ln, contact, pw, tokens):
 
 MAX_RETRY = 3
 
-def create_one(uid, contact, pw):
+# ─── confirm check via forgotten password flow ────────────────
+def confirm_account(contact, ses, ua):
+    """
+    Forgotten Password flow দিয়ে check করে account confirmed কিনা।
+    Returns: True | False
+    """
+    server = "limited.facebook.com"
+    hdrs = {
+        "Host": server,
+        "User-Agent": ua,
+        "Accept": "text/html,application/xhtml+xml,*/*;q=0.9",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": f"https://{server}/login/",
+    }
+
+    # Step 1: load identify page
+    try:
+        r1 = ses.get(
+            f"https://{server}/login/identify/",
+            headers=hdrs, timeout=15
+        )
+    except:
+        return False
+
+    tokens = extract_tokens(r1.text)
+    lsd    = tokens.get("lsd", "")
+
+    # Step 2: submit phone to identify
+    payload_id = {
+        "lsd":           lsd,
+        "email":         contact,
+        "did_use_age_gate": "0",
+        "login_source":  "find_friends",
+        "skip_api_login":"1",
+        "submit":        "Search",
+    }
+    try:
+        r2 = ses.post(
+            f"https://{server}/login/identify/",
+            data=payload_id,
+            headers={**hdrs,
+                     "Content-Type": "application/x-www-form-urlencoded",
+                     "Origin": f"https://{server}"},
+            timeout=15
+        )
+    except:
+        return False
+
+    html2 = r2.text
+    if ("couldn't find" in html2.lower() or
+            "We couldn't find your account" in html2):
+        return False
+
+    # Step 3: request recovery code (SMS then email fallback)
+    tokens2 = extract_tokens(html2)
+    lsd2    = tokens2.get("lsd", lsd)
+
+    n_m   = re.search(r'name="n"\s+value="([^"]+)"', html2)
+    n_val = n_m.group(1) if n_m else ""
+
+    ars_m   = re.search(r'name="ars"\s+value="([^"]+)"', html2)
+    ars_val = ars_m.group(1) if ars_m else ""
+
+    code_signals = [
+        "enter the code", "Enter the code",
+        "confirmation code", "We sent a confirmation",
+        "code we sent", "6-digit code", "check your",
+    ]
+
+    for send_via in ("sms", "email"):
+        payload_send = {
+            "lsd":      lsd2,
+            "n":        n_val,
+            "ars":      ars_val,
+            "send_via": send_via,
+            "submit":   "Continue",
+        }
+        try:
+            r3 = ses.post(
+                f"https://{server}/recover/",
+                data=payload_send,
+                headers={**hdrs,
+                         "Content-Type": "application/x-www-form-urlencoded",
+                         "Origin": f"https://{server}"},
+                timeout=15
+            )
+            if any(sig in r3.text for sig in code_signals):
+                return True
+        except:
+            continue
+
+    # fallback — if forgotten flow reached recover page = account live
+    return bool(n_val)
+
+
+# ─── create + return ses/ua for confirm reuse ─────────────────
+def create_one_ext(uid, contact, pw):
     for attempt in range(1, MAX_RETRY + 1):
         ses, ua = make_session()
         html, tokens, server = load_reg_page(ses, ua)
@@ -220,17 +316,17 @@ def create_one(uid, contact, pw):
                   "checkpoint" in r2.text[:600].lower())
         if fb_uid and fb_uid != "0":
             save_ok_user(uid, fb_uid, contact, pw, ck_str)
-            return "ok", fb_uid, ck_str, dob
+            return "ok", fb_uid, ck_str, dob, ses, ua
         elif is_cp:
             save_cp_user(uid, contact, pw)
-            return "checkpoint", "", "", ""
+            return "checkpoint", "", "", "", ses, ua
         else:
             if attempt < MAX_RETRY:
                 time.sleep(random.uniform(1, 3)); continue
             save_fail_user(uid, contact, r2.text[:100])
-            return "error", "", "", ""
+            return "error", "", "", "", ses, ua
     save_fail_user(uid, contact, "max_retry")
-    return "error", "", "", ""
+    return "error", "", "", "", None, None
 
 # ═══════════════════════════════════════════════════════════════
 # KEYBOARDS
@@ -409,26 +505,44 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         await show_home(update.message, uid)
 
+# ═══════════════════════════════════════════════════════════════
+# CREATE + CONFIRM
+# ═══════════════════════════════════════════════════════════════
+
 async def _do_create(update, uid, phone, pw):
     msg = await update.message.reply_text(
         f"🚀 *Creating...*\n📱 `{phone}`\n🔑 `{pw}`\n\n⏳ Please wait...",
         parse_mode="Markdown")
     loop = asyncio.get_event_loop()
-    result, fb_uid, ck_str, dob = await loop.run_in_executor(
-        None, create_one, uid, phone, pw)
+
+    result, fb_uid, ck_str, dob, ses, ua = await loop.run_in_executor(
+        None, create_one_ext, uid, phone, pw)
 
     if result == "ok":
+        # ── confirm check ─────────────────────────────────────
+        await msg.edit_text(
+            f"✅ *Account Created!*\n📱 `{phone}`\n🆔 `{fb_uid}`\n\n"
+            f"🔍 Checking confirmation...",
+            parse_mode="Markdown")
+
+        confirmed = await loop.run_in_executor(
+            None, confirm_account, phone, ses, ua)
+
+        status_line = "Confirm ✅" if confirmed else "Not confirm ❌"
+
         p1 = ck_str[:300]; p2 = ck_str[300:]
         await msg.edit_text(
             f"✅ *SUCCESS!*\n━━━━━━━━━━━━━━━━━━━━━━\n"
             f"📱 `{phone}`\n🆔 `{fb_uid}`\n"
-            f"🔑 `{pw}`\n🎂 `{dob}`\n\n"
+            f"🔑 `{pw}`\n🎂 `{dob}`\n"
+            f"📌 {status_line}\n\n"
             f"🍪 *Cookie:*\n`{p1}`",
             parse_mode="Markdown")
         if p2:
             await update.message.reply_text(f"`{p2}`", parse_mode="Markdown")
         await update.message.reply_text("🏠 আরো বানাবে?",
                                          reply_markup=main_keyboard())
+
     elif result == "checkpoint":
         await msg.edit_text(f"⚠️ *CHECKPOINT*\n📱 `{phone}`",
                             parse_mode="Markdown")
