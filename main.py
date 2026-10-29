@@ -19,7 +19,6 @@ os.makedirs(DATA_DIR, exist_ok=True)
 lock        = threading.Lock()
 authed_lock = threading.Lock()
 
-# ─── per-user paths ───────────────────────────────────────────
 def user_dir(uid):
     d = os.path.join(DATA_DIR, str(uid))
     os.makedirs(d, exist_ok=True)
@@ -73,7 +72,6 @@ def user_stats(uid):
         except: return 0
     return count(ok_file(uid)), count(cp_file(uid)), count(fail_file(uid))
 
-# ─── auth ─────────────────────────────────────────────────────
 def load_authed():
     try:
         with open(AUTHED_FILE) as f:
@@ -97,7 +95,6 @@ def add_auth(uid):
         authed_users.add(uid)
         save_authed(authed_users)
 
-# ─── user-agent ───────────────────────────────────────────────
 try:
     _ua = UserAgent()
     def rand_ua():
@@ -144,9 +141,9 @@ def extract_tokens(html):
             if m: data[key] = m.group(1)
     return data
 
-def make_session():
+def make_fresh_session(ua=None):
+    if ua is None: ua = rand_ua()
     ses = requests.Session()
-    ua  = rand_ua()
     ses.headers.update({
         "User-Agent": ua,
         "Accept": "text/html,application/xhtml+xml,*/*;q=0.9",
@@ -156,6 +153,11 @@ def make_session():
         "Upgrade-Insecure-Requests": "1"
     })
     ses.cookies.set("locale", "en_US", domain=".facebook.com")
+    return ses
+
+def make_session():
+    ua  = rand_ua()
+    ses = make_fresh_session(ua)
     return ses, ua
 
 def load_reg_page(ses, ua):
@@ -201,33 +203,61 @@ def submit_reg(ses, ua, server, fn, ln, contact, pw, tokens):
 
 MAX_RETRY = 3
 
-# ─── phone exist check via forgotten flow ─────────────────────
+# ─── phone exist check ────────────────────────────────────────
 def check_phone_exists(contact, ua):
-    """
-    True  = এই number এ Facebook account আছে
-    False = account নেই, create করা যাবে
-    """
-    ses = requests.Session()
-    ses.headers.update({
-        "User-Agent": ua,
-        "Accept": "text/html,application/xhtml+xml,*/*;q=0.9",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1"
-    })
-    ses.cookies.set("locale", "en_US", domain=".facebook.com")
-
+    ses    = make_fresh_session(ua)
     server = "limited.facebook.com"
-    hdrs = {
+    hdrs   = {
         "Host": server, "User-Agent": ua,
         "Accept": "text/html,application/xhtml+xml,*/*;q=0.9",
         "Accept-Language": "en-US,en;q=0.9",
         "Referer": f"https://{server}/login/",
     }
     try:
-        r1 = ses.get(f"https://{server}/login/identify/",
-                     headers=hdrs, timeout=15)
+        r1  = ses.get(f"https://{server}/login/identify/",
+                      headers=hdrs, timeout=15)
+        t1  = extract_tokens(r1.text)
+        lsd = t1.get("lsd", "")
+        r2  = ses.post(
+            f"https://{server}/login/identify/",
+            data={
+                "lsd": lsd, "email": contact,
+                "did_use_age_gate": "0",
+                "login_source": "find_friends",
+                "skip_api_login": "1", "submit": "Search",
+            },
+            headers={**hdrs,
+                     "Content-Type": "application/x-www-form-urlencoded",
+                     "Origin": f"https://{server}"},
+            timeout=15)
+        html2 = r2.text.lower()
+        not_found = ["couldn't find your account", "couldn't find",
+                     "no account found", "not find"]
+        if any(s in html2 for s in not_found): return False
+        found = ["recover your account", "reset your password",
+                 "send code", "confirm your identity"]
+        if any(s in html2 for s in found): return True
+        if re.search(r'name="n"\s+value="([^"]+)"', r2.text): return True
+        return False
+    except: return False
+
+# ─── forgotten core: identify → get n/ars/lsd ────────────────
+def _forgotten_identify(contact, ua):
+    """
+    Returns (ses, lsd, n_val, ars_val, hdrs, server) or None on fail.
+    Fresh session her call এ।
+    """
+    ses    = make_fresh_session(ua)
+    server = "limited.facebook.com"
+    hdrs   = {
+        "Host": server, "User-Agent": ua,
+        "Accept": "text/html,application/xhtml+xml,*/*;q=0.9",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": f"https://{server}/login/",
+    }
+    try:
+        r1  = ses.get(f"https://{server}/login/identify/",
+                      headers=hdrs, timeout=15)
         t1  = extract_tokens(r1.text)
         lsd = t1.get("lsd", "")
 
@@ -244,105 +274,39 @@ def check_phone_exists(contact, ua):
                      "Origin": f"https://{server}"},
             timeout=15)
 
-        html2 = r2.text.lower()
+        html2 = r2.text
+        if "couldn't find" in html2.lower(): return None
 
-        # account নেই এই signals গুলো
-        not_found = [
-            "couldn't find your account",
-            "couldn't find",
-            "no account found",
-            "not find",
-        ]
-        if any(s in html2 for s in not_found):
-            return False
+        t2      = extract_tokens(html2)
+        lsd2    = t2.get("lsd", lsd)
+        n_m     = re.search(r'name="n"\s+value="([^"]+)"', html2)
+        n_val   = n_m.group(1) if n_m else t2.get("n", "")
+        ars_m   = re.search(r'name="ars"\s+value="([^"]+)"', html2)
+        ars_val = ars_m.group(1) if ars_m else t2.get("ars", "")
 
-        # account আছে এই signals গুলো
-        found = [
-            "recover your account",
-            "reset your password",
-            "send code",
-            "send sms",
-            "confirm your identity",
-            "name=\"n\"",
-            "name=\"ars\"",
-        ]
-        if any(s in html2 for s in found):
-            return True
+        if not n_val: return None
+        return ses, lsd2, n_val, ars_val, hdrs, server
+    except: return None
 
-        # n token থাকলে account আছে
-        if re.search(r'name="n"\s+value="([^"]+)"', r2.text):
-            return True
-
-        return False
-    except:
-        return False
-
-# ─── forgotten: OTP request (fresh session) ───────────────────
+# ─── forgotten: OTP request ───────────────────────────────────
 def forgotten_request_otp(contact, ua):
-    fresh_ses = requests.Session()
-    fresh_ses.headers.update({
-        "User-Agent": ua,
-        "Accept": "text/html,application/xhtml+xml,*/*;q=0.9",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1"
-    })
-    fresh_ses.cookies.set("locale", "en_US", domain=".facebook.com")
+    res = _forgotten_identify(contact, ua)
+    if not res: return False, {}
 
-    server = "limited.facebook.com"
-    hdrs = {
-        "Host": server, "User-Agent": ua,
-        "Accept": "text/html,application/xhtml+xml,*/*;q=0.9",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": f"https://{server}/login/",
-    }
-
-    try:
-        r1 = fresh_ses.get(f"https://{server}/login/identify/",
-                           headers=hdrs, timeout=15)
-    except: return False, {}
-
-    t1  = extract_tokens(r1.text)
-    lsd = t1.get("lsd", "")
-
-    try:
-        r2 = fresh_ses.post(
-            f"https://{server}/login/identify/",
-            data={
-                "lsd": lsd, "email": contact,
-                "did_use_age_gate": "0",
-                "login_source": "find_friends",
-                "skip_api_login": "1", "submit": "Search",
-            },
-            headers={**hdrs,
-                     "Content-Type": "application/x-www-form-urlencoded",
-                     "Origin": f"https://{server}"},
-            timeout=15)
-    except: return False, {}
-
-    html2 = r2.text
-    if "couldn't find" in html2.lower(): return False, {}
-
-    t2      = extract_tokens(html2)
-    lsd2    = t2.get("lsd", lsd)
-    n_m     = re.search(r'name="n"\s+value="([^"]+)"', html2)
-    n_val   = n_m.group(1) if n_m else t2.get("n", "")
-    ars_m   = re.search(r'name="ars"\s+value="([^"]+)"', html2)
-    ars_val = ars_m.group(1) if ars_m else t2.get("ars", "")
-
-    if not n_val: return False, {}
+    ses, lsd2, n_val, ars_val, hdrs, server = res
 
     code_signals = [
         "enter the code", "Enter the code", "confirmation code",
-        "We sent a confirmation", "code we sent", "6-digit code", "check your",
+        "We sent a confirmation", "code we sent",
+        "6-digit code", "check your", "sent you a code",
+        "enter confirmation code",
     ]
     recover_html = ""
-    sent = False
+    sent         = False
 
     for send_via in ("sms", "email"):
         try:
-            r3 = fresh_ses.post(
+            r3 = ses.post(
                 f"https://{server}/recover/",
                 data={
                     "lsd": lsd2, "n": n_val,
@@ -370,17 +334,15 @@ def forgotten_request_otp(contact, ua):
     return True, {
         "lsd": lsd3, "n": n3_val, "ars": ars3_val,
         "server": server, "hdrs": hdrs,
-        "_ses": fresh_ses
+        "_ses": ses
     }
 
 # ─── forgotten: OTP submit ────────────────────────────────────
 def forgotten_submit_otp(code, recover_tokens):
     active_ses = recover_tokens.get("_ses")
     if active_ses is None: return False
-
     server = recover_tokens.get("server", "limited.facebook.com")
     hdrs   = recover_tokens.get("hdrs", {})
-
     try:
         r = active_ses.post(
             f"https://{server}/recover/",
@@ -394,13 +356,12 @@ def forgotten_submit_otp(code, recover_tokens):
             headers={**hdrs,
                      "Content-Type": "application/x-www-form-urlencoded",
                      "Origin": f"https://{server}"},
-            timeout=15,
-            allow_redirects=True)
+            timeout=15, allow_redirects=True)
 
         html = r.text.lower()
         url  = r.url.lower()
 
-        success_strings = [
+        success_str = [
             "choose a new password", "create new password",
             "reset your password", "new_password",
             "change password", "pick a new password",
@@ -408,22 +369,112 @@ def forgotten_submit_otp(code, recover_tokens):
             "your identity has been confirmed", "code was correct",
             "please choose a new password",
         ]
-        success_url_parts = [
+        success_url = [
             "recover/password", "recover/new_pass",
             "new_password", "checkpoint/block",
         ]
-        fail_strings = [
+        fail_str = [
             "incorrect code", "wrong code", "invalid code",
             "doesn't match", "did not match",
             "code expired", "code has expired",
         ]
 
-        if any(s in html for s in success_strings): return True
-        if any(p in url for p in success_url_parts): return True
-        if any(s in html for s in fail_strings):     return False
+        if any(s in html for s in success_str): return True
+        if any(p in url  for p in success_url): return True
+        if any(s in html for s in fail_str):    return False
         if r.status_code == 200 and "recover" not in url: return True
         return False
     except: return False
+
+# ─── forgotten: retry identify then submit (when OTP was not auto-sent) ──
+def forgotten_retry_and_submit(contact, code, ua):
+    """
+    OTP auto-send হয়নি কিন্তু user manually code পেয়েছে।
+    Fresh identify → recover submit করো code দিয়ে।
+    """
+    res = _forgotten_identify(contact, ua)
+    if not res: return False
+
+    ses, lsd2, n_val, ars_val, hdrs, server = res
+
+    # direct code submit — send_via ছাড়াই
+    try:
+        r = ses.post(
+            f"https://{server}/recover/",
+            data={
+                "lsd":    lsd2,
+                "n":      n_val,
+                "ars":    ars_val,
+                "code":   code.strip(),
+                "submit": "Continue",
+            },
+            headers={**hdrs,
+                     "Content-Type": "application/x-www-form-urlencoded",
+                     "Origin": f"https://{server}"},
+            timeout=15, allow_redirects=True)
+
+        html = r.text.lower()
+        url  = r.url.lower()
+
+        success_str = [
+            "choose a new password", "create new password",
+            "reset your password", "new_password",
+            "change password", "secure your account",
+            "your identity has been confirmed", "code was correct",
+        ]
+        success_url = [
+            "recover/password", "recover/new_pass",
+            "new_password", "checkpoint/block",
+        ]
+        fail_str = [
+            "incorrect code", "wrong code", "invalid code",
+            "doesn't match", "did not match",
+            "code expired", "code has expired",
+        ]
+
+        if any(s in html for s in success_str): return True
+        if any(p in url  for p in success_url): return True
+        if any(s in html for s in fail_str):    return False
+        if r.status_code == 200 and "recover" not in url: return True
+    except: pass
+
+    # fallback: sms/email send করার চেষ্টা তারপর submit
+    for send_via in ("sms", "email"):
+        try:
+            res2 = _forgotten_identify(contact, ua)
+            if not res2: continue
+            ses2, lsd3, n2, ars2, hdrs2, server2 = res2
+
+            ses2.post(
+                f"https://{server2}/recover/",
+                data={"lsd": lsd3, "n": n2, "ars": ars2,
+                      "send_via": send_via, "submit": "Continue"},
+                headers={**hdrs2,
+                         "Content-Type": "application/x-www-form-urlencoded",
+                         "Origin": f"https://{server2}"},
+                timeout=15)
+
+            r4 = ses2.post(
+                f"https://{server2}/recover/",
+                data={"lsd": lsd3, "n": n2, "ars": ars2,
+                      "code": code.strip(), "submit": "Continue"},
+                headers={**hdrs2,
+                         "Content-Type": "application/x-www-form-urlencoded",
+                         "Origin": f"https://{server2}"},
+                timeout=15, allow_redirects=True)
+
+            html4 = r4.text.lower()
+            url4  = r4.url.lower()
+            if any(s in html4 for s in [
+                "choose a new password", "new_password",
+                "reset your password", "code was correct",
+                "your identity has been confirmed"
+            ]): return True
+            if any(p in url4 for p in ["recover/password", "new_password"]):
+                return True
+        except: continue
+
+    return False
 
 # ─── create account ───────────────────────────────────────────
 def create_one_ext(uid, contact, pw):
@@ -643,13 +694,15 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
 
         code           = text
-        recover_tokens = pending["recover_tokens"]
+        recover_tokens = pending.get("recover_tokens", {})
+        otp_sent       = pending.get("otp_sent", False)
         fb_uid         = pending["fb_uid"]
         phone          = pending["phone"]
         pw             = pending["pw"]
         ck_str         = pending["ck_str"]
         dob            = pending["dob"]
         bot_uid        = pending["bot_uid"]
+        ua             = pending["ua"]
 
         ctx.user_data["state"] = ""
         ctx.user_data.pop("pending_account", None)
@@ -658,8 +711,15 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "🔍 *Verifying code...*", parse_mode="Markdown")
 
         loop = asyncio.get_event_loop()
-        confirmed = await loop.run_in_executor(
-            None, forgotten_submit_otp, code, recover_tokens)
+
+        if otp_sent and recover_tokens:
+            # normal path — same session দিয়ে submit
+            confirmed = await loop.run_in_executor(
+                None, forgotten_submit_otp, code, recover_tokens)
+        else:
+            # OTP auto-send হয়নি — retry identify + submit
+            confirmed = await loop.run_in_executor(
+                None, forgotten_retry_and_submit, phone, code, ua)
 
         save_ok_user(bot_uid, fb_uid, phone, pw, ck_str, confirmed)
         status_line = "Confirm ✅" if confirmed else "Not confirm ❌"
@@ -678,11 +738,11 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await show_home(update.message, uid)
 
 # ═══════════════════════════════════════════════════════════════
-# CREATE → CHECK EXIST → SHOW INFO → ASK OTP
+# CREATE → CHECK → SHOW INFO → OTP
 # ═══════════════════════════════════════════════════════════════
 
 async def _do_create(update, ctx, uid, phone, pw):
-    msg = await update.message.reply_text(
+    msg  = await update.message.reply_text(
         f"🔍 *Checking number...*\n📱 `{phone}`\n\n⏳ Please wait...",
         parse_mode="Markdown")
     loop = asyncio.get_event_loop()
@@ -697,16 +757,15 @@ async def _do_create(update, ctx, uid, phone, pw):
             f"⚠️ *Number Already Registered!*\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"📱 `{phone}`\n\n"
-            f"❌ আপনার number এ আগে থেকেই Facebook account আছে।\n"
+            f"❌ এই number এ আগে থেকেই Facebook account আছে।\n"
             f"অন্য number দিয়ে try করুন।",
             parse_mode="Markdown")
         await update.message.reply_text("🏠", reply_markup=main_keyboard())
         return
 
-    # ── Step 2: account create ────────────────────────────────
+    # ── Step 2: create ────────────────────────────────────────
     await msg.edit_text(
-        f"✅ *Number OK!*\n📱 `{phone}`\n\n"
-        f"🚀 Creating account...",
+        f"✅ *Number OK!*\n📱 `{phone}`\n\n🚀 Creating account...",
         parse_mode="Markdown")
 
     result, fb_uid, ck_str, dob, ua = await loop.run_in_executor(
@@ -738,25 +797,27 @@ async def _do_create(update, ctx, uid, phone, pw):
     if p2:
         await update.message.reply_text(f"`{p2}`", parse_mode="Markdown")
 
-    # ── Step 4: forgotten flow → OTP পাঠাও ───────────────────
+    # ── Step 4: OTP পাঠাও ────────────────────────────────────
     otp_msg = await update.message.reply_text(
         "📨 *Sending OTP...*", parse_mode="Markdown")
 
     sent, recover_tokens = await loop.run_in_executor(
         None, forgotten_request_otp, phone, ua)
 
-    # ── Step 5: সবসময় OTP চাও ───────────────────────────────
+    # ── Step 5: pending state save করো ───────────────────────
     ctx.user_data["state"] = "wait_otp"
     ctx.user_data["pending_account"] = {
         "recover_tokens": recover_tokens,
+        "otp_sent":       sent,
         "fb_uid": fb_uid, "phone": phone,
         "pw": pw, "ck_str": ck_str,
         "dob": dob, "bot_uid": uid,
+        "ua": ua,
     }
 
     otp_note = ("📩 Facebook এ OTP code পাঠানো হয়েছে।"
                 if sent else
-                "⚠️ Auto OTP send হয়নি — SMS/email চেক করো।")
+                "⚠️ Auto OTP send হয়নি — আপনার SMS/email চেক করো।")
 
     await otp_msg.edit_text(
         f"{otp_note}\n\n"
