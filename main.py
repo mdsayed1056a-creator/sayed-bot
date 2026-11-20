@@ -63,7 +63,7 @@ def save_cp_user(uid, contact, pw):
 def save_fail_user(uid, contact, reason):
     with lock:
         with open(fail_file(uid), "a") as f:
-            f.write(f"FAIL|PHONE:{contact}|REASON:{reason[:80]}\n")
+            f.write(f"FAIL|PHONE:{contact}|REASON:{reason[:200]}\n")
 
 # ─── stats per user ───────────────────────────────────────────
 def user_stats(uid):
@@ -124,24 +124,54 @@ def get_name():
     return random.choice(FIRSTS), random.choice(LASTS)
 
 def extract_tokens(html):
+    """Extract all necessary tokens from Facebook registration page"""
     data = {}
     try:
         soup = BeautifulSoup(html, "html.parser")
         for inp in soup.find_all("input"):
             n = inp.get("name"); v = inp.get("value", "")
             if n: data[n] = v
-    except: pass
-    for key, pat in {
-        "lsd":               r'"LSD",\[\],\{"token":"([^"]+)"',
-        "jazoest":           r'jazoest[="\s:]+([0-9]+)',
-        "fb_dtsg":           r'"DTSGInitData",\[\],\{"token":"([^"]+)"',
-        "reg_instance":      r'"reg_instance"\s*[=:,\[]+\s*"([^"]{6,})"',
-        "reg_impression_id": r'"reg_impression_id"\s*[=:,\[]+\s*"([^"]{6,})"',
-        "logger_id":         r'"logger_id"\s*[=:,\[]+\s*"([^"]{6,})"',
-    }.items():
+    except Exception as e:
+        print(f"[ERROR] BeautifulSoup parsing failed: {e}")
+    
+    # Extract tokens from JavaScript/HTML
+    patterns = {
+        "lsd": [
+            r'"LSD",\[\],\{"token":"([^"]+)"',
+            r'name="lsd"\s+value="([^"]+)"',
+            r'"lsd":"([^"]+)"'
+        ],
+        "jazoest": [
+            r'jazoest[="\s:]+([0-9]+)',
+            r'name="jazoest"\s+value="([^"]+)"'
+        ],
+        "fb_dtsg": [
+            r'"DTSGInitData",\[\],\{"token":"([^"]+)"',
+            r'name="fb_dtsg"\s+value="([^"]+)"',
+            r'"fb_dtsg":"([^"]+)"'
+        ],
+        "reg_instance": [
+            r'"reg_instance"\s*[=:,\[]+\s*"([^"]{6,})"',
+            r'name="reg_instance"\s+value="([^"]+)"'
+        ],
+        "reg_impression_id": [
+            r'"reg_impression_id"\s*[=:,\[]+\s*"([^"]{6,})"',
+            r'name="reg_impression_id"\s+value="([^"]+)"'
+        ],
+        "logger_id": [
+            r'"logger_id"\s*[=:,\[]+\s*"([^"]{6,})"',
+            r'name="logger_id"\s+value="([^"]+)"'
+        ],
+    }
+    
+    for key, pats in patterns.items():
         if not data.get(key):
-            m = re.search(pat, html)
-            if m: data[key] = m.group(1)
+            for pat in pats:
+                m = re.search(pat, html)
+                if m:
+                    data[key] = m.group(1)
+                    break
+    
     return data
 
 def make_session():
@@ -149,88 +179,180 @@ def make_session():
     ua  = rand_ua()
     ses.headers.update({
         "User-Agent": ua,
-        "Accept": "text/html,application/xhtml+xml,*/*;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate",
+        "Accept-Encoding": "gzip, deflate, br",
         "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1"
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1"
     })
     ses.cookies.set("locale", "en_US", domain=".facebook.com")
     return ses, ua
 
 def load_reg_page(ses, ua):
-    server = "limited.facebook.com"
-    try:
-        r = ses.get(f"https://{server}/reg/", timeout=15,
-                    headers={"User-Agent": ua, "Host": server})
-        tokens = extract_tokens(r.text)
-        if tokens.get("lsd") or tokens.get("jazoest") or "reg_email" in r.text:
-            return r.text, tokens, server
-    except: pass
-    return "", {}, server
+    """Try multiple Facebook registration endpoints"""
+    endpoints = [
+        "https://m.facebook.com/r.php",
+        "https://www.facebook.com/r.php",
+        "https://m.facebook.com/reg/",
+        "https://www.facebook.com/reg/"
+    ]
+    
+    for url in endpoints:
+        try:
+            print(f"[INFO] Trying: {url}")
+            r = ses.get(url, timeout=15, headers={"User-Agent": ua})
+            print(f"[INFO] Status: {r.status_code}, Length: {len(r.text)}")
+            
+            tokens = extract_tokens(r.text)
+            print(f"[INFO] Tokens found: {list(tokens.keys())}")
+            
+            # Check if we got a valid registration page
+            if tokens.get("lsd") or tokens.get("jazoest") or "reg_email" in r.text or "birthday" in r.text.lower():
+                print(f"[SUCCESS] Valid registration page found at: {url}")
+                return r.text, tokens, url
+        except Exception as e:
+            print(f"[ERROR] Failed to load {url}: {e}")
+            continue
+    
+    print("[ERROR] All endpoints failed")
+    return "", {}, ""
 
-def submit_reg(ses, ua, server, fn, ln, contact, pw, tokens):
+def submit_reg(ses, ua, url, fn, ln, contact, pw, tokens):
+    """Submit registration form"""
     dob_d = str(random.randint(10, 25))
     dob_m = str(random.randint(1, 12))
     dob_y = str(random.randint(1985, 2000))
     enc   = f"#PWD_BROWSER:0:{int(time.time())}:{pw}"
+    
+    # Build payload with all available tokens
     payload = {
-        "lsd": tokens.get("lsd", ""), "jazoest": tokens.get("jazoest", ""),
-        "fb_dtsg": tokens.get("fb_dtsg", ""),
-        "reg_instance": tokens.get("reg_instance", ""),
-        "reg_impression_id": tokens.get("reg_impression_id", ""),
-        "logger_id": tokens.get("logger_id", ""),
-        "firstname": fn, "lastname": ln,
-        "birthday_day": dob_d, "birthday_month": dob_m, "birthday_year": dob_y,
-        "sex": "2", "encpass": enc, "reg_passwd__": pw,
-        "reg_email__": contact, "reg_email_confirmation__": contact,
-        "ccp": "2", "ns": "1", "submission_request": "true",
-        "submit": "Sign Up", "terms": "on", "locale": "en_US"
+        "firstname": fn,
+        "lastname": ln,
+        "reg_email__": contact,
+        "reg_email_confirmation__": contact,
+        "birthday_day": dob_d,
+        "birthday_month": dob_m,
+        "birthday_year": dob_y,
+        "sex": str(random.choice([1, 2])),
+        "reg_passwd__": pw,
+        "encpass": enc,
+        "terms": "on",
+        "submit": "Sign Up",
     }
+    
+    # Add all extracted tokens
+    for key, value in tokens.items():
+        if value:
+            payload[key] = value
+    
+    # Determine the submit URL
+    if "r.php" in url:
+        submit_url = url.replace("r.php", "r.php")
+    elif "reg/" in url:
+        submit_url = url + "submit/"
+    else:
+        submit_url = url
+    
     hdrs = {
-        "Host": server, "User-Agent": ua,
+        "User-Agent": ua,
         "Content-Type": "application/x-www-form-urlencoded",
-        "Referer": f"https://{server}/reg/", "Origin": f"https://{server}",
-        "Accept": "text/html,application/xhtml+xml,*/*;q=0.9",
-        "Accept-Language": "en-US,en;q=0.9", "Accept-Encoding": "gzip, deflate",
-        "upgrade-insecure-requests": "1"
+        "Referer": url,
+        "Origin": "https://m.facebook.com" if "m.facebook" in url else "https://www.facebook.com",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
     }
-    r = ses.post(f"https://{server}/reg/submit/", data=payload,
-                 headers=hdrs, timeout=20, allow_redirects=True)
+    
+    print(f"[INFO] Submitting to: {submit_url}")
+    print(f"[INFO] Payload keys: {list(payload.keys())}")
+    
+    r = ses.post(submit_url, data=payload, headers=hdrs, timeout=20, allow_redirects=True)
+    print(f"[INFO] Response status: {r.status_code}, URL: {r.url}")
+    
     return r, dob_d, dob_m, dob_y
 
 MAX_RETRY = 3
 
 def create_one(uid, contact, pw):
+    """Create one Facebook account with retry logic"""
+    last_error = ""
+    
     for attempt in range(1, MAX_RETRY + 1):
-        ses, ua = make_session()
-        html, tokens, server = load_reg_page(ses, ua)
-        if not html:
-            time.sleep(2); continue
+        print(f"\n[ATTEMPT {attempt}/{MAX_RETRY}] Creating account for: {contact}")
+        
         try:
-            r2, dob_d, dob_m, dob_y = submit_reg(
-                ses, ua, server, *get_name(), contact, pw, tokens)
-        except:
-            time.sleep(2); continue
-        ck     = ses.cookies.get_dict()
-        fb_uid = ck.get("c_user", "")
-        ck_str = "; ".join(f"{k}={v}" for k, v in ck.items())
-        dob    = f"{dob_d}-{dob_m}-{dob_y}"
-        is_cp  = ("checkpoint" in r2.url.lower() or
-                  "checkpoint" in r2.text[:600].lower())
-        if fb_uid and fb_uid != "0":
-            save_ok_user(uid, fb_uid, contact, pw, ck_str)
-            return "ok", fb_uid, ck_str, dob
-        elif is_cp:
-            save_cp_user(uid, contact, pw)
-            return "checkpoint", "", "", ""
-        else:
+            ses, ua = make_session()
+            html, tokens, url = load_reg_page(ses, ua)
+            
+            if not html:
+                last_error = "Failed to load registration page"
+                print(f"[ERROR] {last_error}")
+                time.sleep(3)
+                continue
+            
+            if not tokens:
+                last_error = "No tokens extracted from page"
+                print(f"[ERROR] {last_error}")
+                time.sleep(3)
+                continue
+            
+            fn, ln = get_name()
+            print(f"[INFO] Name: {fn} {ln}")
+            
+            r2, dob_d, dob_m, dob_y = submit_reg(ses, ua, url, fn, ln, contact, pw, tokens)
+            
+            ck = ses.cookies.get_dict()
+            fb_uid = ck.get("c_user", "")
+            ck_str = "; ".join(f"{k}={v}" for k, v in ck.items())
+            dob = f"{dob_d}-{dob_m}-{dob_y}"
+            
+            print(f"[INFO] UID: {fb_uid}")
+            print(f"[INFO] Cookies: {list(ck.keys())}")
+            
+            is_cp = ("checkpoint" in r2.url.lower() or 
+                    "checkpoint" in r2.text[:1000].lower() or
+                    "confirm" in r2.text[:1000].lower())
+            
+            if fb_uid and fb_uid != "0":
+                print(f"[SUCCESS] Account created! UID: {fb_uid}")
+                save_ok_user(uid, fb_uid, contact, pw, ck_str)
+                return "ok", fb_uid, ck_str, dob
+            elif is_cp:
+                print(f"[CHECKPOINT] Account needs verification")
+                save_cp_user(uid, contact, pw)
+                return "checkpoint", "", "", ""
+            else:
+                # Check for specific error messages
+                error_text = r2.text[:500].lower()
+                if "already" in error_text or "exists" in error_text:
+                    last_error = "Phone number already registered"
+                elif "invalid" in error_text:
+                    last_error = "Invalid phone number"
+                elif "blocked" in error_text or "rate" in error_text:
+                    last_error = "Rate limited or blocked"
+                else:
+                    last_error = f"Unknown error (status: {r2.status_code})"
+                
+                print(f"[ERROR] {last_error}")
+                
+                if attempt < MAX_RETRY:
+                    wait_time = random.uniform(3, 6)
+                    print(f"[INFO] Waiting {wait_time:.1f}s before retry...")
+                    time.sleep(wait_time)
+                    continue
+                    
+        except Exception as e:
+            last_error = f"Exception: {str(e)[:100]}"
+            print(f"[EXCEPTION] {last_error}")
             if attempt < MAX_RETRY:
-                time.sleep(random.uniform(1, 3)); continue
-            save_fail_user(uid, contact, r2.text[:100])
-            return "error", "", "", ""
-    save_fail_user(uid, contact, "max_retry")
-    return "error", "", "", ""
+                time.sleep(3)
+                continue
+    
+    save_fail_user(uid, contact, last_error)
+    return "error", "", "", last_error
 
 # ═══════════════════════════════════════════════════════════════
 # KEYBOARDS & UI DESIGN
@@ -364,7 +486,8 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "➕ *CREATE NEW ACCOUNT*\n"
             "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n"
             "Please provide the phone number.\n"
-            "📌 *Format:* `+8801XXXXXXXXX` (with country code)"
+            "📌 *Format:* Any valid phone with country code\n"
+            "Example: `+8801XXXXXXXXX` or `+2376XXXXXXXX`"
             f"{pw_hint}"
         )
         await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=back_keyboard())
@@ -376,7 +499,8 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "1️⃣ *Set Password* → Save your default password.\n"
             "2️⃣ *Create Account* → Provide a valid phone number.\n"
             "3️⃣ *Copy Data* → Save the generated UID & Cookie.\n\n"
-            "💡 *Note:* Each user's data is stored separately and securely."
+            "💡 *Note:* Each user's data is stored separately and securely.\n"
+            "⚠️ *Warning:* Use fresh phone numbers only!"
         )
         await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=back_keyboard())
 
@@ -445,7 +569,7 @@ async def _do_create(update, uid, phone, pw):
         "⏳ *Please wait while we create your account...*")
     
     loop = asyncio.get_event_loop()
-    result, fb_uid, ck_str, dob = await loop.run_in_executor(None, create_one, uid, phone, pw)
+    result, fb_uid, ck_str, error_msg = await loop.run_in_executor(None, create_one, uid, phone, pw)
 
     if result == "ok":
         p1 = ck_str[:300]
@@ -456,8 +580,7 @@ async def _do_create(update, uid, phone, pw):
             "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n"
             f"📱 *Phone:* `{phone}`\n"
             f"🆔 *UID:* `{fb_uid}`\n"
-            f"🔑 *Pass:* `{pw}`\n"
-            f"🎂 *DOB:* `{dob}`\n\n"
+            f"🔑 *Pass:* `{pw}`\n\n"
             "🍪 *COOKIE (Part 1):*\n"
             f"`{p1}`"
         )
@@ -484,8 +607,12 @@ async def _do_create(update, uid, phone, pw):
         await msg.edit_text(
             "❌ *CREATION FAILED*\n"
             "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n"
-            f"📱 *Phone:* `{phone}`\n\n"
-            "Please try again with a different number.",
+            f"📱 *Phone:* `{phone}`\n"
+            f"⚠️ *Error:* {error_msg}\n\n"
+            "💡 *Tips:*\n"
+            "• Use a fresh phone number\n"
+            "• Wait 5-10 minutes before retrying\n"
+            "• Try a different country code",
             parse_mode="Markdown")
         await update.message.reply_text("🏠 *Return to Main Menu*", reply_markup=main_keyboard())
 
